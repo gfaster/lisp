@@ -1,3 +1,4 @@
+use crate::env::{static_sym, Symbol};
 use std::any::Any;
 use std::cell::Cell;
 use std::io::prelude::{Read, Write};
@@ -8,7 +9,6 @@ use env::Env;
 mod env;
 mod intrinsics;
 
-type Symbol = Rc<str>;
 type LispResult = Result<Datum, Error>;
 
 macro_rules! error_and_units {
@@ -37,11 +37,12 @@ macro_rules! error_and_units {
     }
 }
 
-error_and_units!{
+error_and_units! {
     TypeError,
     SymbolNotFound,
     MismatchedParamNum,
-    SyntaxError
+    SyntaxError,
+    UnquoteOutOfQuasiquote,
 }
 
 impl std::fmt::Display for Error {
@@ -50,7 +51,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error { }
+impl std::error::Error for Error {}
 
 #[derive(Clone, Default)]
 enum Datum {
@@ -58,11 +59,17 @@ enum Datum {
     Atom(i64),
     Cons(Rc<Cons>),
     Func(fn(List, Rc<Env>) -> LispResult),
-    Lambda(Lambda),
+    Lambda(Rc<Lambda>),
     Obj(Rc<dyn Any>),
 
     #[default]
     Nil,
+}
+
+impl std::fmt::Debug for Datum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as std::fmt::Display>::fmt(self, f)
+    }
 }
 
 impl FromIterator<Datum> for Datum {
@@ -91,13 +98,13 @@ impl Datum {
         match self {
             Datum::Cons(c) => Ok(List(Some(Rc::clone(c)))),
             Datum::Nil => Ok(List(None)),
-            _ => Err(TypeError)
+            _ => Err(TypeError),
         }
     }
 
     fn as_sym(&self) -> Result<Symbol, TypeError> {
         if let Self::Symbol(s) = self {
-            Ok(Rc::clone(s))
+            Ok(*s)
         } else {
             Err(TypeError)
         }
@@ -105,7 +112,7 @@ impl Datum {
 
     fn eval(&self, env: Rc<Env>) -> LispResult {
         match self {
-            Datum::Symbol(s) => env.get(s).ok_or(Error::SymbolNotFound),
+            Datum::Symbol(s) => env.get(*s).ok_or(Error::SymbolNotFound),
             Datum::Atom(i) => Ok(Datum::Atom(*i)),
             Datum::Cons(c) => c.eval(env),
             Datum::Func(f) => Ok(Datum::Func(*f)),
@@ -122,9 +129,8 @@ impl<const LEN: usize> From<[Datum; LEN]> for Datum {
     }
 }
 
-#[derive(Clone)]
 struct Lambda {
-    params: Rc<[Symbol]>,
+    params: Box<[Symbol]>,
     body: List,
 }
 
@@ -132,25 +138,20 @@ impl Lambda {
     fn eval(&self, params: Option<Rc<Cons>>, env: Rc<Env>) -> LispResult {
         let param_vals: Vec<_> = Cons::flat_iter(params).collect();
         if param_vals.len() != self.params.len() {
-            return Err(Error::MismatchedParamNum)
+            return Err(Error::MismatchedParamNum);
         }
 
         let env = env.extend();
-        for (sym, val) in self.params.iter().zip(param_vals) {
-            env.declare(Rc::clone(sym), val);
+        for (&sym, val) in self.params.iter().zip(param_vals) {
+            env.declare(sym, val);
         }
-
-        if let Some(ref body) = self.body.0 {
-            body.eval(env)
-        } else {
-            Ok(Datum::Nil)
-        }
+        intrinsics::progn(self.body.clone(), env)
     }
 }
 
 struct Cons {
     car: Cell<Datum>,
-    cdr: Cell<Option<Rc<Cons>>>
+    cdr: Cell<Option<Rc<Cons>>>,
 }
 
 impl Cons {
@@ -164,7 +165,7 @@ impl Cons {
     fn new(car: Datum) -> Self {
         Cons {
             car: car.into(),
-            cdr: None.into()
+            cdr: None.into(),
         }
     }
 
@@ -208,30 +209,24 @@ impl Cons {
 
     fn eval(&self, env: Rc<Env>) -> LispResult {
         let op = match self.get_car() {
-            Datum::Atom(_) |
-            Datum::Obj(_) |
-            Datum::Nil => return Err(Error::TypeError),
+            Datum::Atom(_) | Datum::Obj(_) | Datum::Nil => return Err(Error::TypeError),
             Datum::Cons(c) => c.eval(env.clone())?,
             Datum::Symbol(s) => env.get(s).ok_or(SymbolNotFound)?,
-            op => op
+            op => op,
         };
-        
+
         match op {
-            Datum::Atom(_) |
-            Datum::Cons(_) |
-            Datum::Obj(_) |
-            Datum::Nil |
-            Datum::Symbol(_) => Err(Error::TypeError),
-            Datum::Func(f) => {
-                f(List(self.get_cdr()), env)
-            },
+            Datum::Atom(_) | Datum::Cons(_) | Datum::Obj(_) | Datum::Nil | Datum::Symbol(_) => {
+                Err(Error::TypeError)
+            }
+            Datum::Func(f) => f(List(self.get_cdr()), env),
             Datum::Lambda(l) => l.eval(self.get_cdr(), env),
         }
     }
 }
 
 struct ConsIter {
-    cons: Option<Rc<Cons>>
+    cons: Option<Rc<Cons>>,
 }
 
 impl ConsIter {
@@ -290,11 +285,20 @@ impl std::fmt::Display for List {
     }
 }
 
-// impl List {
-//     fn front(&self) -> Option<Rc<Cons>> {
-//         self.0.clone()
-//     }
-// }
+impl std::fmt::Debug for List {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <Self as std::fmt::Display>::fmt(self, f)
+    }
+}
+
+impl List {
+    fn to_datum(self) -> Datum {
+        match self.0 {
+            Some(a) => Datum::Cons(a),
+            None => Datum::Nil,
+        }
+    }
+}
 
 impl IntoIterator for List {
     type Item = Datum;
@@ -315,7 +319,9 @@ impl FromIterator<Datum> for List {
 fn read(buf: &str) -> Datum {
     fn read_list(mut s: &str) -> (Datum, &str) {
         s = s.trim_start();
-        let Some(first_c) = s.chars().nth(0) else { panic!("No closing paren") };
+        let Some(first_c) = s.chars().nth(0) else {
+            panic!("No closing paren")
+        };
         if first_c == ')' {
             return (Datum::Nil, &s[1..]);
         }
@@ -324,20 +330,73 @@ fn read(buf: &str) -> Datum {
         let cdr = match cdr {
             Datum::Cons(cons) => Some(cons),
             Datum::Nil => None,
-            _ => unreachable!("read_list returns a list")
+            _ => unreachable!("read_list returns a list"),
         };
         (Datum::Cons(Cons::new_pair(car, cdr).into()), rem)
+    }
+
+    fn read_str(s: &str) -> (Datum, &str) {
+        let mut it = s.char_indices();
+        let mut buf = String::new();
+        if it.next() != Some((0, '"')) {
+            unreachable!()
+        }
+        while let Some((i, c)) = it.next() {
+            if c == '"' {
+                let ret: Rc<dyn Any> = Rc::new(buf);
+                return (Datum::Obj(ret), &s[(i + 1)..]);
+            }
+            if c == '\\' {
+                match it.next() {
+                    Some((_, 'n')) => buf.push('\n'),
+                    Some((_, 't')) => buf.push('\t'),
+                    Some((_, '\\')) => buf.push('\\'),
+                    Some((_, '"')) => buf.push('"'),
+                    None => panic!("No close quote"),
+                    Some((_, c)) => panic!("Unknown escaped character: {c}"),
+                }
+                continue;
+            }
+            buf.push(c);
+        }
+        panic!("No close quote")
     }
 
     fn read_s(s: &str) -> (Datum, &str) {
         let s = s.trim_start();
         let mut it = s.chars();
-        let Some(first_c) = it.next() else { return (Datum::Nil, s) };
+        let Some(first_c) = it.next() else {
+            return (Datum::Nil, s);
+        };
         match first_c {
-            ')'  => panic!("Extra closing paren"),
-            '('  => read_list(&s[1..]),
+            ')' => panic!("Extra closing paren"),
+            '(' => read_list(&s[1..]),
+            '\'' => {
+                let (expr, rem) = read_s(&s[1..]);
+                let sym = static_sym!("quote");
+                ([Datum::Symbol(sym), expr].into(), rem)
+            }
+            '`' => {
+                let (expr, rem) = read_s(&s[1..]);
+                let sym = static_sym!("quasiquote");
+                ([Datum::Symbol(sym), expr].into(), rem)
+            }
+            ',' => {
+                if it.next() == Some('@') {
+                    let (expr, rem) = read_s(&s[2..]);
+                    let sym = static_sym!("unquotesplice");
+                    ([Datum::Symbol(sym), expr].into(), rem)
+                } else {
+                    let (expr, rem) = read_s(&s[1..]);
+                    let sym = static_sym!("unquote");
+                    ([Datum::Symbol(sym), expr].into(), rem)
+                }
+            }
+            '"' => read_str(s),
             c => {
-                let len = 1 + it.take_while(|&c| !c.is_ascii_whitespace() && c != '(' && c != ')').count();
+                let len = 1 + it
+                    .take_while(|&c| !c.is_ascii_whitespace() && c != '(' && c != ')')
+                    .count();
                 let dat = &s[..len];
                 let dat = if dat == "nil" {
                     Datum::Nil
@@ -373,11 +432,11 @@ fn main() {
         std::io::stdin().read_line(&mut buf).unwrap();
         match read(&buf).eval(Rc::clone(&root_env)) {
             Ok(dat) => {
-                println!("{dat}"); 
-            },
+                println!("{dat}");
+            }
             Err(e) => {
-                println!("ERROR: {e}"); 
-            },
+                println!("ERROR: {e}");
+            }
         }
         buf.clear();
     }
