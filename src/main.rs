@@ -8,50 +8,12 @@ use env::Env;
 
 mod env;
 mod intrinsics;
+mod error;
+use error::*;
 
 type LispResult = Result<Datum, Error>;
 
-macro_rules! error_and_units {
-    ($($id:ident),* $(,)?) => {
-        #[derive(Debug, Clone)]
-        enum Error {
-            $($id),*
-        }
-        $(error_and_units!(@decl $id);)*
-    };
-    (@decl $id:ident) => {
-        #[derive(Debug, Clone, Copy)]
-        struct $id;
-        impl std::fmt::Display for $id {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                <Self as std::fmt::Debug>::fmt(self, f)
-            }
-        }
-        impl std::error::Error for $id { }
 
-        impl From<$id> for Error {
-            fn from(_value: $id) -> Error {
-                Error::$id
-            }
-        }
-    }
-}
-
-error_and_units! {
-    TypeError,
-    SymbolNotFound,
-    MismatchedParamNum,
-    SyntaxError,
-    UnquoteOutOfQuasiquote,
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        <Self as std::fmt::Debug>::fmt(self, f)
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[derive(Clone, Default)]
 enum Datum {
@@ -61,6 +23,10 @@ enum Datum {
     Func(fn(List, Rc<Env>) -> LispResult),
     Lambda(Rc<Lambda>),
     Obj(Rc<dyn Any>),
+    Macro(Rc<Macro>),
+
+    #[allow(dead_code)]
+    DynamicExtent(Rc<Env>),
 
     #[default]
     Nil,
@@ -110,15 +76,39 @@ impl Datum {
         }
     }
 
+    /// See [`List::stream_map_symbols`] - Note that this won't modify the cons if this belongs to
+    /// one
+    #[allow(dead_code)]
+    fn stream_map_symbols(self, mut f: impl FnMut(Symbol) -> Symbol) -> Self {
+        if let Self::Symbol(s) = self {
+            return Self::Symbol(f(s))
+        } 
+        if let Self::Cons(c) = &self {
+            List(Some(c.clone())).stream_map_symbols(f)
+        }
+        self
+    }
+
+    /// clones all nested lists, but keeps everything else aliased
+    #[allow(dead_code)]
+    fn list_clone(self) -> Self {
+        if let Ok(l) = self.as_list() {
+            return l.into_iter().map(|x| x.list_clone()).collect()
+        }
+        self
+    }
+
     fn eval(&self, env: Rc<Env>) -> LispResult {
         match self {
-            Datum::Symbol(s) => env.get(*s).ok_or(Error::SymbolNotFound),
+            Datum::Symbol(s) => env.get(*s).ok_or(Error::SymbolNotFound(*s)),
             Datum::Atom(i) => Ok(Datum::Atom(*i)),
             Datum::Cons(c) => c.eval(env),
             Datum::Func(f) => Ok(Datum::Func(*f)),
             Datum::Lambda(l) => Ok(Datum::Lambda(l.clone())),
             Datum::Obj(o) => Ok(Datum::Obj(o.clone())),
             Datum::Nil => Ok(Datum::Nil),
+            Datum::Macro(m) => Ok(Datum::Macro(m.clone())),
+            Datum::DynamicExtent(e) => Ok(Datum::DynamicExtent(e.clone())),
         }
     }
 }
@@ -149,6 +139,27 @@ impl Lambda {
     }
 }
 
+struct Macro {
+    /// these symbols should be unique
+    args: Vec<Symbol>,
+    body: Datum,
+}
+
+impl Macro {
+    fn expand(&self, l: List, env: Rc<Env>) -> LispResult {
+        let env = env.extend();
+        let mut it = l.into_iter();
+        for &sym in &self.args {
+            let val = it.next().ok_or(MismatchedParamNum)?;
+            env.declare(sym, val);
+        }
+        if it.next().is_some() {
+            return Err(Error::MismatchedParamNum);
+        }
+        self.body.eval(env)
+    }
+}
+
 struct Cons {
     car: Cell<Datum>,
     cdr: Cell<Option<Rc<Cons>>>,
@@ -160,6 +171,15 @@ impl Cons {
             car: car.into(),
             cdr: cdr.into(),
         }
+    }
+
+    fn as_pair(&self) -> Result<(Datum, Datum), MismatchedParamNum> {
+        let left = self.get_car();
+        let right = self.get_cdr().ok_or(MismatchedParamNum)?;
+        if right.get_cdr().is_some() {
+            return Err(MismatchedParamNum)
+        }
+        Ok((left, right.get_car()))
     }
 
     fn new(car: Datum) -> Self {
@@ -186,6 +206,10 @@ impl Cons {
         ret
     }
 
+    fn set_car(&self, car: Datum) {
+        self.car.set(car)
+    }
+
     fn get_car(&self) -> Datum {
         let car = self.car.replace(Datum::Nil);
         self.car.set(car.clone());
@@ -196,6 +220,16 @@ impl Cons {
         let cdr = self.cdr.take();
         self.cdr.set(cdr.clone());
         cdr
+    }
+
+    #[allow(dead_code)]
+    fn get_cadr(&self) -> Option<Datum> {
+        self.get_cdr().map(|x| x.get_car())
+    }
+
+    #[allow(dead_code)]
+    fn get_caadr(&self) -> Option<Datum> {
+        self.get_cdr().and_then(|x| x.get_cdr()).map(|x| x.get_car())
     }
 
     #[allow(dead_code)]
@@ -211,16 +245,21 @@ impl Cons {
         let op = match self.get_car() {
             Datum::Atom(_) | Datum::Obj(_) | Datum::Nil => return Err(Error::TypeError),
             Datum::Cons(c) => c.eval(env.clone())?,
-            Datum::Symbol(s) => env.get(s).ok_or(SymbolNotFound)?,
+            Datum::Symbol(s) => env.get(s).ok_or(SymbolNotFound(s))?,
             op => op,
         };
 
         match op {
             Datum::Atom(_) | Datum::Cons(_) | Datum::Obj(_) | Datum::Nil | Datum::Symbol(_) => {
                 Err(Error::TypeError)
-            }
+            },
+            Datum::Macro(m) => m.expand(List(self.get_cdr()), env.clone())?.eval(env),
             Datum::Func(f) => f(List(self.get_cdr()), env),
             Datum::Lambda(l) => l.eval(self.get_cdr(), env),
+            Datum::DynamicExtent(e) => {
+                let (_, inner) = self.as_pair()?;
+                inner.eval(env.extend_with(&e))
+            },
         }
     }
 }
@@ -255,6 +294,8 @@ impl std::fmt::Display for Datum {
             Datum::Nil => write!(f, "()"),
             Datum::Lambda(l) => write!(f, "[lambda at {l:p}]"),
             Datum::Obj(o) => write!(f, "[object at {o:p}]"),
+            Datum::Macro(m) => write!(f, "[macro at {m:p}]"),
+            Datum::DynamicExtent(e) => write!(f, "[dynamic extent at {e:p}]"),
         }
     }
 }
@@ -296,6 +337,41 @@ impl List {
         match self.0 {
             Some(a) => Datum::Cons(a),
             None => Datum::Nil,
+        }
+    }
+
+    fn as_args<const N: usize>(self) -> Result<[Datum; N], MismatchedParamNum> {
+        // TODO: avoid alloc
+        let v: Vec<_> = self.into_iter().collect();
+        v.try_into().map_err(|_| MismatchedParamNum)
+    }
+
+    /// mutates symbols recursively, fails on cycles, does not modify dynamic extents (for now). We
+    /// don't modify lambdas either, since they're already compiled if we encounter them, but we
+    /// will modify lambda definitions.
+    ///
+    /// `f` should return its passed symbol if it doesn't want to modify it.
+    fn stream_map_symbols(self, f: impl FnMut(Symbol) -> Symbol) {
+        let mut next = self.0.clone();
+        let mut f: Box<dyn FnMut(Symbol) -> Symbol> = Box::new(f);
+        while let Some(curr) = next {
+            let car = curr.get_car();
+            if let Ok(sym) = car.as_sym() {
+                curr.set_car(Datum::Symbol(f(sym)));
+            } else {
+                match car {
+                    Datum::Symbol(_) => unreachable!(),
+                    Datum::Atom(_) => (),
+                    Datum::Cons(c) => List(Some(c)).stream_map_symbols(&mut f),
+                    Datum::Func(_) => (),
+                    Datum::Lambda(_) => (),
+                    Datum::Obj(_) => (),
+                    Datum::Macro(_) => (),
+                    Datum::DynamicExtent(_) => (),
+                    Datum::Nil => (),
+                }
+            }
+            next = curr.get_cdr();
         }
     }
 }

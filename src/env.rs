@@ -20,7 +20,7 @@ impl Symbol {
         SymTable::get_borrowed(name)
     }
 
-    pub fn gensym(prefix: &str) -> Self {
+    pub fn gensym(prefix: impl std::fmt::Display) -> Self {
         SymTable::gensym(prefix)
     }
 }
@@ -77,7 +77,7 @@ impl SymTable {
         })
     }
 
-    fn gensym(prefix: &str) -> Symbol {
+    fn gensym(prefix: impl std::fmt::Display) -> Symbol {
         let sym = SymTable::new_symbol_no_insert();
         let name: Rc<str> = format!("__{prefix}{}__", sym.0).into();
         let ret = SYMS.with(|t: &SymTable| {
@@ -137,7 +137,7 @@ impl From<&str> for Symbol {
 
 pub struct Env(RefCell<EnvInner>);
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct EnvInner {
     up: Option<Rc<Env>>,
     syms: HashMap<Symbol, Datum>,
@@ -146,6 +146,12 @@ struct EnvInner {
 impl Env {
     pub fn new() -> Rc<Self> {
         Rc::new(Env(EnvInner::default().into()))
+    }
+
+    /// returns a copy of self with just the most recent extent
+    #[allow(dead_code)]
+    pub fn clone_shallow(&self) -> Rc<Self> {
+        Rc::new(Env(self.0.borrow().clone().into()))
     }
 
     pub fn get(&self, sym: Symbol) -> Option<Datum> {
@@ -189,5 +195,12 @@ impl Env {
             syms: HashMap::new(),
         }
         .into()))
+    }
+
+    /// extend with a shallow clone of other
+    pub fn extend_with(self: Rc<Self>, other: &Self) -> Rc<Self> {
+        let mut new_inner = other.0.borrow().clone();
+        new_inner.up = Some(self);
+        Rc::new(Env(new_inner.into()))
     }
 }

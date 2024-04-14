@@ -1,4 +1,4 @@
-use crate::{Error, Symbol, UnquoteOutOfQuasiquote};
+use crate::{Error, Macro, Symbol, UnquoteOutOfQuasiquote};
 use std::rc::Rc;
 
 use crate::{
@@ -10,6 +10,7 @@ pub fn declare_intrinsics(env: &Env) {
     env.declare("+".into(), Datum::Func(add));
     env.declare("-".into(), Datum::Func(sub));
     env.declare("*".into(), Datum::Func(mul));
+    env.declare("list".into(), Datum::Func(list));
     env.declare("lambda".into(), Datum::Func(lambda));
     env.declare("defun".into(), Datum::Func(defun));
     env.declare("defvar".into(), Datum::Func(defvar));
@@ -19,6 +20,9 @@ pub fn declare_intrinsics(env: &Env) {
     env.declare("quote".into(), Datum::Func(quote));
     env.declare("unquote".into(), Datum::Func(unquote));
     env.declare("quasiquote".into(), Datum::Func(quasiquote));
+    env.declare("progn".into(), Datum::Func(progn));
+    env.declare("expandmacro".into(), Datum::Func(expandmacro));
+    env.declare("defmacro".into(), Datum::Func(defmacro));
 }
 
 fn add(l: List, env: Rc<Env>) -> LispResult {
@@ -49,6 +53,10 @@ fn mul(l: List, env: Rc<Env>) -> LispResult {
         })
         .try_fold(0, |acc, val| val.map(|v| acc * v))
         .map(|val| crate::Datum::Atom(val))
+}
+
+fn list(l: List, env: Rc<Env>) -> LispResult {
+    l.into_iter().map(|x| x.eval(env.clone())).collect()
 }
 
 fn lambda(l: List, _env: Rc<Env>) -> LispResult {
@@ -108,6 +116,7 @@ pub fn quasiquote(l: List, env: Rc<Env>) -> LispResult {
         }
         body.eval(env)
     }
+
     fn unquote_splice_valid(l: List, env: Rc<Env>) -> Result<List, Error> {
         let mut it = l.into_iter();
         let Some(body) = it.next() else {
@@ -169,7 +178,7 @@ fn setq(l: List, env: Rc<Env>) -> LispResult {
     let mut it = l.into_iter();
     let sym = it.next().ok_or(SyntaxError)?.as_sym()?;
     let val = it.next().ok_or(SyntaxError)?.eval(env.clone())?;
-    env.set(sym, val.clone()).ok().ok_or(SymbolNotFound)?;
+    env.set(sym, val.clone()).ok().ok_or(SymbolNotFound(sym))?;
     Ok(val)
 }
 
@@ -207,4 +216,30 @@ fn if_expr(l: List, env: Rc<Env>) -> LispResult {
 pub fn progn(l: List, env: Rc<Env>) -> LispResult {
     l.into_iter()
         .try_fold(Datum::Nil, |_acc, x| x.eval(Rc::clone(&env)))
+}
+
+fn expandmacro(l: List, env: Rc<Env>) -> LispResult {
+    let [sym, args] = l.as_args()?;
+    let m = sym.eval(env.clone())?;
+    let Datum::Macro(m) = m else { return Err(Error::TypeError) };
+    let args = args.eval(env.clone())?;
+    m.expand(args.as_list()?, env)
+}
+
+fn defmacro(l: List, env: Rc<Env>) -> LispResult {
+    let [sym, args, body] = l.as_args()?;
+    let sym = sym.as_sym()?;
+    let args: Vec<_> = args.as_list()?.into_iter().map(|x| x.as_sym()).collect::<Result<_, _>>()?;
+    let mut transformed_args = Vec::with_capacity(args.len());
+    for &arg in args.iter() {
+        transformed_args.push(Symbol::gensym(arg))
+    }
+    let body = body.stream_map_symbols(|sym| args.iter().position(|&x| x == sym).map_or(sym, |i| transformed_args[i]));
+    let m = Macro {
+        args: transformed_args,
+        body,
+    };
+    let ret = Datum::Macro(Rc::new(m));
+    env.declare(sym, ret.clone());
+    Ok(ret)
 }
