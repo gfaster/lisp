@@ -10,6 +10,7 @@ mod env;
 mod intrinsics;
 mod error;
 use error::*;
+mod gc;
 
 type LispResult = Result<Datum, Error>;
 
@@ -24,12 +25,47 @@ enum Datum {
     Lambda(Rc<Lambda>),
     Obj(Rc<dyn Any>),
     Macro(Rc<Macro>),
+    Goto(Symbol),
 
     #[allow(dead_code)]
     DynamicExtent(Rc<Env>),
 
     #[default]
     Nil,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Type {
+    Symbol,
+    Atom,
+    Cons,
+    Func,
+    Lambda,
+    Function,
+    Obj,
+    String,
+    List,
+    Macro,
+    Goto,
+    DynamicExtent,
+    Nil
+}
+
+impl From<&Datum> for Type {
+    fn from(value: &Datum) -> Self {
+        match value {
+            Datum::Symbol(_) => Type::Symbol,
+            Datum::Atom(_) => Type::Atom,
+            Datum::Cons(_) => Type::Cons,
+            Datum::Func(_) => Type::Func,
+            Datum::Lambda(_) => Type::Lambda,
+            Datum::Obj(_) => Type::Obj,
+            Datum::Macro(_) => Type::Macro,
+            Datum::Goto(_) => Type::Goto,
+            Datum::DynamicExtent(_) => Type::DynamicExtent,
+            Datum::Nil => Type::Nil,
+        }
+    }
 }
 
 impl std::fmt::Debug for Datum {
@@ -56,7 +92,7 @@ impl Datum {
         if let Self::Atom(a) = self {
             Ok(*a)
         } else {
-            Err(TypeError)
+            Err(type_err(Type::Atom, self))
         }
     }
 
@@ -64,7 +100,7 @@ impl Datum {
         match self {
             Datum::Cons(c) => Ok(List(Some(Rc::clone(c)))),
             Datum::Nil => Ok(List(None)),
-            _ => Err(TypeError),
+            _ => Err(type_err(Type::Cons, self)),
         }
     }
 
@@ -72,13 +108,12 @@ impl Datum {
         if let Self::Symbol(s) = self {
             Ok(*s)
         } else {
-            Err(TypeError)
+            Err(type_err(Type::Symbol, self))
         }
     }
 
     /// See [`List::stream_map_symbols`] - Note that this won't modify the cons if this belongs to
     /// one
-    #[allow(dead_code)]
     fn stream_map_symbols(self, mut f: impl FnMut(Symbol) -> Symbol) -> Self {
         if let Self::Symbol(s) = self {
             return Self::Symbol(f(s))
@@ -100,7 +135,7 @@ impl Datum {
 
     fn eval(&self, env: Rc<Env>) -> LispResult {
         match self {
-            Datum::Symbol(s) => env.get(*s).ok_or(Error::SymbolNotFound(*s)),
+            Datum::Symbol(s) => Ok(env.get(*s)?),
             Datum::Atom(i) => Ok(Datum::Atom(*i)),
             Datum::Cons(c) => c.eval(env),
             Datum::Func(f) => Ok(Datum::Func(*f)),
@@ -109,7 +144,25 @@ impl Datum {
             Datum::Nil => Ok(Datum::Nil),
             Datum::Macro(m) => Ok(Datum::Macro(m.clone())),
             Datum::DynamicExtent(e) => Ok(Datum::DynamicExtent(e.clone())),
+            Datum::Goto(label) => Ok(Datum::Goto(*label)),
         }
+    }
+
+    // fn resolve(self, env: Rc<Env>) -> LispResult {
+    //     match self {
+    //         Datum::Symbol(s) => Ok(env.get(s)?),
+    //         Datum::Cons(c) => c.resolve(env),
+    //         other => Ok(other)
+    //     }
+    // }
+
+    fn try_as<T: 'static>(&self) -> Result<Rc<T>, TypeError> {
+        if let Datum::Obj(o) = self {
+            if let Ok(ret) = Rc::clone(o).downcast() {
+                return Ok(ret)
+            }
+        }
+        Err(type_err(Type::String, self))
     }
 }
 
@@ -120,43 +173,30 @@ impl<const LEN: usize> From<[Datum; LEN]> for Datum {
 }
 
 struct Lambda {
-    params: Box<[Symbol]>,
+    params: ArgList,
     body: List,
 }
 
 impl Lambda {
-    fn eval(&self, params: Option<Rc<Cons>>, env: Rc<Env>) -> LispResult {
-        let param_vals: Vec<_> = Cons::flat_iter(params).collect();
-        if param_vals.len() != self.params.len() {
-            return Err(Error::MismatchedParamNum);
-        }
-
-        let env = env.extend();
-        for (&sym, val) in self.params.iter().zip(param_vals) {
-            env.declare(sym, val);
-        }
+    fn eval(&self, l: List, env: Rc<Env>) -> LispResult {
+        let l = l.into_iter().map(|x| x.eval(env.clone())).collect::<Result<List, _>>()?;
+        let env = self.params.enter_env(l, env)?;
         intrinsics::progn(self.body.clone(), env)
     }
 }
 
 struct Macro {
     /// these symbols should be unique
-    args: Vec<Symbol>,
+    args: ArgList,
     body: Datum,
 }
 
 impl Macro {
     fn expand(&self, l: List, env: Rc<Env>) -> LispResult {
-        let env = env.extend();
-        let mut it = l.into_iter();
-        for &sym in &self.args {
-            let val = it.next().ok_or(MismatchedParamNum)?;
-            env.declare(sym, val);
-        }
-        if it.next().is_some() {
-            return Err(Error::MismatchedParamNum);
-        }
-        self.body.eval(env)
+        // dbg!(&l);
+        let env = self.args.enter_env(l, env)?;
+        // Ok(Datum::from_iter([Datum::DynamicExtent(env), self.body.clone()]))
+        self.body.eval(env).inspect_err(|e| eprintln!("expand error {e}"))
     }
 }
 
@@ -166,18 +206,18 @@ struct Cons {
 }
 
 impl Cons {
-    fn new_pair(car: Datum, cdr: Option<Rc<Cons>>) -> Self {
+    fn new_pair(car: Datum, cdr: List) -> Self {
         Cons {
             car: car.into(),
-            cdr: cdr.into(),
+            cdr: cdr.0.into(),
         }
     }
 
-    fn as_pair(&self) -> Result<(Datum, Datum), MismatchedParamNum> {
+    fn as_pair(&self) -> Result<(Datum, Datum), NotAPair> {
         let left = self.get_car();
-        let right = self.get_cdr().ok_or(MismatchedParamNum)?;
+        let right = self.get_cdr().ok_or(NotAPair)?;
         if right.get_cdr().is_some() {
-            return Err(MismatchedParamNum)
+            return Err(NotAPair)
         }
         Ok((left, right.get_car()))
     }
@@ -210,6 +250,10 @@ impl Cons {
         self.car.set(car)
     }
 
+    fn set_cdr(&self, List(cdr): List) {
+        self.cdr.set(cdr)
+    }
+
     fn get_car(&self) -> Datum {
         let car = self.car.replace(Datum::Nil);
         self.car.set(car.clone());
@@ -233,48 +277,51 @@ impl Cons {
     }
 
     #[allow(dead_code)]
-    fn iter(self: Rc<Self>) -> ConsIter {
-        ConsIter { cons: Some(self) }
+    fn iter(self: Rc<Self>) -> DatumIter {
+        DatumIter { cons: Some(self) }
     }
 
-    fn flat_iter(cons: Option<Rc<Self>>) -> ConsIter {
-        ConsIter { cons }
-    }
+    // fn resolve(self: Rc<Self>, env: Rc<Env>) {
+    // }
+
 
     fn eval(&self, env: Rc<Env>) -> LispResult {
-        let op = match self.get_car() {
-            Datum::Atom(_) | Datum::Obj(_) | Datum::Nil => return Err(Error::TypeError),
-            Datum::Cons(c) => c.eval(env.clone())?,
-            Datum::Symbol(s) => env.get(s).ok_or(SymbolNotFound(s))?,
-            op => op,
-        };
+        // eprintln!("car before eval {}", self.get_car());
+        // let op = match self.get_car() {
+        //     fail @ Datum::Atom(_) | fail @ Datum::Obj(_) | fail @ Datum::Nil => return Err(WrongTypeToApply(fail).into()),
+        //     Datum::Cons(c) => c.eval(env.clone())?,
+        //     Datum::Symbol(s) => env.get(s)?,
+        //     op => op,
+        // };
+        let op = self.get_car().eval(env.clone())?;
 
         match op {
             Datum::Atom(_) | Datum::Cons(_) | Datum::Obj(_) | Datum::Nil | Datum::Symbol(_) => {
-                Err(Error::TypeError)
+                Err(WrongTypeToApply(op).into())
             },
             Datum::Macro(m) => m.expand(List(self.get_cdr()), env.clone())?.eval(env),
             Datum::Func(f) => f(List(self.get_cdr()), env),
-            Datum::Lambda(l) => l.eval(self.get_cdr(), env),
+            Datum::Lambda(l) => l.eval(List(self.get_cdr()), env),
             Datum::DynamicExtent(e) => {
                 let (_, inner) = self.as_pair()?;
-                inner.eval(env.extend_with(&e))
+                inner.eval(env.extend_with(&e)).inspect_err(|e| eprintln!("dynamic extent error {e}"))
             },
+            Datum::Goto(l) => Ok(Datum::Goto(l)),
         }
     }
 }
 
-struct ConsIter {
+struct DatumIter {
     cons: Option<Rc<Cons>>,
 }
 
-impl ConsIter {
+impl DatumIter {
     fn rem(self) -> List {
         List(self.cons)
     }
 }
 
-impl Iterator for ConsIter {
+impl Iterator for DatumIter {
     type Item = Datum;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -296,6 +343,7 @@ impl std::fmt::Display for Datum {
             Datum::Obj(o) => write!(f, "[object at {o:p}]"),
             Datum::Macro(m) => write!(f, "[macro at {m:p}]"),
             Datum::DynamicExtent(e) => write!(f, "[dynamic extent at {e:p}]"),
+            Datum::Goto(label) => write!(f, "[goto {label}]"),
         }
     }
 }
@@ -343,7 +391,18 @@ impl List {
     fn as_args<const N: usize>(self) -> Result<[Datum; N], MismatchedParamNum> {
         // TODO: avoid alloc
         let v: Vec<_> = self.into_iter().collect();
-        v.try_into().map_err(|_| MismatchedParamNum)
+        v.try_into().map_err(|_| MismatchedParamNum(0, 0))
+    }
+
+    fn as_args_and_rem<const N: usize>(self) -> Result<([Datum; N], Self), MismatchedParamNum> {
+        // TODO: avoid alloc
+        let mut v = Vec::with_capacity(N);
+        let mut it = self.into_iter();
+        for _ in 0..N {
+            v.push(it.next().ok_or(MismatchedParamNum(v.capacity() as u8, v.len() as u8))?)
+        }
+        let arr = v.try_into().expect("v has correct size");
+        Ok((arr, it.rem()))
     }
 
     /// mutates symbols recursively, fails on cycles, does not modify dynamic extents (for now). We
@@ -356,21 +415,7 @@ impl List {
         let mut f: Box<dyn FnMut(Symbol) -> Symbol> = Box::new(f);
         while let Some(curr) = next {
             let car = curr.get_car();
-            if let Ok(sym) = car.as_sym() {
-                curr.set_car(Datum::Symbol(f(sym)));
-            } else {
-                match car {
-                    Datum::Symbol(_) => unreachable!(),
-                    Datum::Atom(_) => (),
-                    Datum::Cons(c) => List(Some(c)).stream_map_symbols(&mut f),
-                    Datum::Func(_) => (),
-                    Datum::Lambda(_) => (),
-                    Datum::Obj(_) => (),
-                    Datum::Macro(_) => (),
-                    Datum::DynamicExtent(_) => (),
-                    Datum::Nil => (),
-                }
-            }
+            curr.set_car(car.stream_map_symbols(&mut f));
             next = curr.get_cdr();
         }
     }
@@ -379,10 +424,10 @@ impl List {
 impl IntoIterator for List {
     type Item = Datum;
 
-    type IntoIter = ConsIter;
+    type IntoIter = DatumIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        ConsIter { cons: self.0 }
+        DatumIter { cons: self.0 }
     }
 }
 
@@ -392,9 +437,82 @@ impl FromIterator<Datum> for List {
     }
 }
 
+struct ArgList {
+    args: Box<[Symbol]>,
+    last_is_rest: bool,
+}
+
+impl ArgList {
+    fn new(l: List) -> Result<Self, Error> {
+        let rest = static_sym!("&rest");
+        let body = static_sym!("&body");
+        let mut args = Vec::new();
+        let mut last_is_rest = false;
+        let mut complete = false;
+        for s in l {
+            if complete {
+                return Err(Error::MalformedArgList);
+            }
+            let sym = s.as_sym()?;
+            if sym == rest || sym == body {
+                if last_is_rest {
+                    return Err(Error::MalformedArgList);
+                }
+                last_is_rest = true;
+                continue;
+            }
+            args.push(sym);
+            if last_is_rest {
+                complete = true;
+            }
+        }
+        if last_is_rest && !complete {
+            return Err(Error::MalformedArgList);
+        }
+        Ok(ArgList {
+            args: args.into(),
+            last_is_rest,
+        })
+    }
+
+    fn enter_env(&self, args: List, env: Rc<Env>) -> Result<Rc<Env>, Error> {
+        let env = env.extend();
+        if self.last_is_rest {
+            let mut it = args.into_iter();
+            if self.args.len() < 1 {
+                unreachable!("creation of ArgList should not let this happen")
+            }
+            for &sym in &self.args[..(self.args.len() - 1)] {
+                env.declare(sym, it.next().ok_or(MismatchedParamNum(0, 0))?);
+            }
+            env.declare(*self.args.last().expect("nonempty"), it.rem().to_datum());
+        } else {
+            let mut it = args.into_iter();
+            for &sym in &*self.args {
+                env.declare(sym, it.next().ok_or(MismatchedParamNum(0,0))?);
+            }
+            if it.next().is_some() {
+                return Err(MismatchedParamNum(0,0).into())
+            }
+        }
+        Ok(env)
+    }
+}
+
 fn read(buf: &str) -> Datum {
+    fn trim_comments(mut s: &str) -> &str {
+        loop {
+            s = s.trim_start();
+            if s.starts_with(';') {
+                let idx = s.find('\n').unwrap_or(s.len()); 
+                s = &s[idx..]
+            } else {
+                return s;
+            }
+        }
+    }
     fn read_list(mut s: &str) -> (Datum, &str) {
-        s = s.trim_start();
+        s = trim_comments(s);
         let Some(first_c) = s.chars().nth(0) else {
             panic!("No closing paren")
         };
@@ -408,7 +526,7 @@ fn read(buf: &str) -> Datum {
             Datum::Nil => None,
             _ => unreachable!("read_list returns a list"),
         };
-        (Datum::Cons(Cons::new_pair(car, cdr).into()), rem)
+        (Datum::Cons(Cons::new_pair(car, List(cdr)).into()), rem)
     }
 
     fn read_str(s: &str) -> (Datum, &str) {
@@ -439,7 +557,7 @@ fn read(buf: &str) -> Datum {
     }
 
     fn read_s(s: &str) -> (Datum, &str) {
-        let s = s.trim_start();
+        let s = trim_comments(s);
         let mut it = s.chars();
         let Some(first_c) = it.next() else {
             return (Datum::Nil, s);
@@ -456,6 +574,15 @@ fn read(buf: &str) -> Datum {
                 let (expr, rem) = read_s(&s[1..]);
                 let sym = static_sym!("quasiquote");
                 ([Datum::Symbol(sym), expr].into(), rem)
+            }
+            '#' => {
+                if it.next() == Some('\'') {
+                    let (expr, rem) = read_s(&s[2..]);
+                    let sym = static_sym!("function");
+                    ([Datum::Symbol(sym), expr].into(), rem)
+                } else {
+                    panic!("idk yet")
+                }
             }
             ',' => {
                 if it.next() == Some('@') {
@@ -491,8 +618,9 @@ fn read(buf: &str) -> Datum {
 
 fn read_file(p: impl AsRef<std::path::Path>, env: Rc<Env>) -> std::io::Result<()> {
     let mut f = std::fs::File::open(p)?;
-    let mut buf = String::new();
+    let mut buf = String::from("(list ");
     f.read_to_string(&mut buf)?;
+    buf.push_str(" )");
     read(&buf).eval(env).unwrap();
     Ok(())
 }

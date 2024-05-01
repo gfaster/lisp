@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::Datum;
+use crate::{Datum, SymbolNotFound};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(u32);
@@ -79,7 +79,7 @@ impl SymTable {
 
     fn gensym(prefix: impl std::fmt::Display) -> Symbol {
         let sym = SymTable::new_symbol_no_insert();
-        let name: Rc<str> = format!("__{prefix}{}__", sym.0).into();
+        let name: Rc<str> = format!("_g:{prefix}_{}", sym.0).into();
         let ret = SYMS.with(|t: &SymTable| {
             let mut table = t.syms.take().unwrap_or_else(|| HashMap::new());
             let mut names = t.sym_names.take().unwrap_or_else(|| HashMap::new());
@@ -154,13 +154,14 @@ impl Env {
         Rc::new(Env(self.0.borrow().clone().into()))
     }
 
-    pub fn get(&self, sym: Symbol) -> Option<Datum> {
+    pub fn get(&self, sym: Symbol) -> Result<Datum, SymbolNotFound> {
         let guard = self.0.borrow();
         guard
             .syms
             .get(&sym)
             .cloned()
-            .or_else(|| guard.up.as_deref().and_then(|x| x.get(sym)))
+            .or_else(|| guard.up.as_deref().and_then(|x| x.get(sym).ok()))
+            .ok_or(SymbolNotFound(sym))
     }
 
     #[allow(dead_code)]
