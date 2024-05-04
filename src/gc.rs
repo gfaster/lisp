@@ -1,4 +1,4 @@
-use std::{cell::{Cell, RefCell}, marker::{PhantomData, PhantomPinned}, mem, pin::Pin, ptr::{self, NonNull}};
+use std::{cell::{Cell, RefCell}, marker::{PhantomData, PhantomPinned}, mem::{self, MaybeUninit}, pin::Pin, ptr::{self, NonNull}};
 
 mod trace;
 mod root_ref;
@@ -19,7 +19,7 @@ impl<T> Allocation<T> {
 
 pub struct Context {
     allocs: RefCell<Vec<*const Allocation<dyn Trace>>>,
-    roots: RefCell<Vec<*const Allocation<dyn Trace>>>,
+    roots: RefCell<Vec<*const dyn Trace>>,
     /// this is a usize so we can declare nested safe points
     safe_point: Cell<usize>,
 }
@@ -35,31 +35,48 @@ impl Context {
         }
     }
 
-    unsafe fn push_alloc(alloc: *const Allocation<dyn Trace>) {
+    unsafe fn push_alloc<'a, T: Trace + 'a>(alloc: *const Allocation<T>) {
         THREAD_CONTEXT.with(|tc| {
             let mut allocs = tc.allocs.borrow_mut();
-            allocs.push(alloc);
+            type R<'a> = &'a Allocation<dyn Trace>;
+            type P = *const Allocation<dyn Trace>;
+            let ptr: P = unsafe { mem::transmute::<P, P>(alloc as *const _) };
+            let ptr = unsafe { std::mem::transmute::<P, P>(ptr) };
+            allocs.push(ptr);
         })
     }
 
-    /// this assumes the allocation has already been pushed
-    unsafe fn push_root(alloc: *const Allocation<dyn Trace>) -> usize {
+    unsafe fn push_root<T: Trace>() -> usize {
         THREAD_CONTEXT.with(|tc| {
             let mut roots = tc.roots.borrow_mut();
             let slots = roots.len();
-            roots.push(alloc);
+            type P = *const dyn Trace;
+            let ptr = ptr::null::<T>() as P;
+            let ptr = unsafe { std::mem::transmute::<P, P>(ptr) };
+            roots.push(ptr);
             slots
         })
     }
 
-    /// this assumes the allocation has already been pushed
-    unsafe fn set_alloc(slot: usize, alloc: *const Allocation<dyn Trace>) {
+    unsafe fn set_root<T: Trace>(slot: usize, root: NonNull<T>) {
         THREAD_CONTEXT.with(|tc| {
             let mut roots = tc.roots.borrow_mut();
             debug_assert_eq!(roots[slot] as *const (), ptr::null());
-            roots[slot] = alloc;
-        });
+            type P = *const dyn Trace;
+            let ptr = root.as_ptr() as P;
+            let ptr = unsafe { std::mem::transmute::<P, P>(ptr) };
+            roots[slot] = ptr;
+        })
     }
+
+    // /// this assumes the allocation has already been pushed
+    // unsafe fn set_alloc(slot: usize, alloc: *const dyn Trace) {
+    //     THREAD_CONTEXT.with(|tc| {
+    //         let mut roots = tc.roots.borrow_mut();
+    //         debug_assert_eq!(roots[slot] as *const (), ptr::null());
+    //         roots[slot] = alloc;
+    //     });
+    // }
 
     unsafe fn pop() {
         THREAD_CONTEXT.with(|tc: &Context| {
@@ -113,7 +130,7 @@ impl Context {
                 return
             }
             for &root in &*tc.roots.borrow() {
-                unsafe { (*root).item.mark(true) };
+                unsafe { (*root).mark(true) };
             }
             tc.allocs.borrow_mut().retain(|&dead| {
                 if unsafe { (*dead).marked.get() } {
@@ -124,7 +141,7 @@ impl Context {
                 }
             });
             for &root in &*tc.roots.borrow() {
-                unsafe { (*root).item.mark(false) };
+                unsafe { (*root).mark(false) };
             }
         });
         IS_COLLECTION.set(false);
@@ -148,9 +165,11 @@ impl Drop for StableToken {
     }
 }
 
+/// we can't use MaybeUninit with RootTruth due to the lack of Trace implementation.
 pub struct RootTruth<T: ?Sized> {
-    _phantom: PhantomData<(PhantomPinned, *mut T)>,
+    _phantom: PhantomData<PhantomPinned>,
     slot: usize,
+    item: T,
 }
 
 impl<T: ?Sized> Drop for RootTruth<T> {
@@ -160,38 +179,39 @@ impl<T: ?Sized> Drop for RootTruth<T> {
 }
 
 impl<'a, T: Trace + 'a> RootTruth<T> {
-    pub unsafe fn new_empty() -> Self {
-        // this is to remove the liftime of the pointer
-        let ptr = ptr::null_mut::<Allocation<T>>() as *const Allocation<dyn Trace>;
-        type P = *const Allocation<dyn Trace>;
-        let ptr = unsafe { std::mem::transmute::<P, P>(ptr) };
-        let slot = unsafe { Context::push_root(ptr) };
-        RootTruth { slot, _phantom: PhantomData }
+    pub unsafe fn new(item: T) -> Self {
+        let slot = Context::push_root::<T>();
+        RootTruth { _phantom: PhantomData, item, slot }
     }
 
-    unsafe fn register(this: Pin<&'a mut Self>, item: *mut Allocation<T>) {
+    unsafe fn lock(this: Pin<&'a mut Self>, slot: usize) -> RootRef<'a, T> {
         // need to remove the lifetime of item since we can only set alloc once
-        let ptr = item.cast_const() as *const Allocation<dyn Trace>;
-        type P = *const Allocation<dyn Trace>;
-        let ptr = unsafe { std::mem::transmute::<P, P>(ptr) };
-        Context::set_alloc(this.slot, ptr)
+        Context::set_root(slot, (&this.item).into());
+        this.into()
     }
 }
 
+impl<'a, T: Trace + 'a> RootTruth<Gc<'a, T>> {
+    pub unsafe fn new_heap(item: T) -> Self {
+        let slot = Context::push_root::<Gc<'_, T>>();
+        let item = Gc::new_unbounded(item);
+        RootTruth { _phantom: PhantomData, item, slot}
+    }
+
+    unsafe fn lock_heap(this: Pin<&'a mut Self>, slot: usize) -> Root<'a, T> {
+        Context::set_root(slot, (&*this.item).into());
+        Root { truth: PhantomData, item: this.item.item }
+    }
+}
+
+/// rooted pointer to the heap
 #[derive(Clone, Copy)]
 pub struct Root<'a, T> {
-    truth: PhantomData<Pin<&'a mut RootTruth<T>>>,
+    truth: PhantomData<Pin<&'a mut RootTruth<Allocation<T>>>>,
     item: NonNull<Allocation<T>>,
 }
 
 impl<'root, T: Trace + 'root> Root<'root, T> {
-    unsafe fn new_unchecked(truth: Pin<&'root mut RootTruth<T>>, item: T) -> Self {
-        let item = Allocation::new(item);
-        RootTruth::register(truth, item.as_ptr());
-        Root { truth: PhantomData, item }
-    }
-
-
     fn to_gc(self) -> Gc<'root, T> {
         Gc {
             item: self.item,
@@ -210,40 +230,37 @@ impl<'root, T: Trace + 'root> From<Root<'root, T>> for Gc<'root, T> {
 impl<'root, 'old, T> Root<'root, T> 
 where T: WithGcLt<'root, To = T> + Trace,
 {
-    unsafe fn from_gc_unchecked(truth: Pin<&'root mut RootTruth<T>>, item: Gc<'old, T>) -> Root<'root, T::To>
+    unsafe fn from_gc_unchecked(empty: RootEmpty<'root, Gc<'root, T>>, item: Gc<'old, T>) -> Root<'root, T::To>
     {
-        let item = item.item;
-        RootTruth::register(truth, item.as_ptr());
-        Root { truth: PhantomData, item }
-    }
-}
-
-impl<'root, T> std::ops::Deref for Root<'root, T> {
-    type Target = RootRef<'root, T>;
-
-    fn deref(&self) -> &Self::Target {
-        self.into()
+        let ret = Root {
+            truth: PhantomData,
+            item: item.item,
+        };
+        empty.set(unsafe { WithGcLt::extend_lifetime(item) });
+        ret
     }
 }
 
 pub struct RootEmpty<'root, T> {
-    truth: Pin<&'root mut RootTruth<T>>,
+    truth: Pin<&'root mut RootTruth<Option<T>>>,
 }
 
 impl<'root, T: 'root> RootEmpty<'root, T> {
-    unsafe fn new_unchecked(truth: Pin<&'root mut RootTruth<T>>) -> Self {
+    unsafe fn new_unchecked(truth: Pin<&'root mut RootTruth<Option<T>>>) -> Self {
         Self { truth }
     }
 
-    fn set(self, item: T) -> Root<'root, T> where T: Trace {
-        unsafe { Root::new_unchecked(self.truth, item) }
+    fn set(mut self, item: T) -> RootRef<'root, T> where T: Trace {
+        unsafe { self.truth.as_mut().get_unchecked_mut().item = Some(item) };
+        let slot = self.truth.slot;
+        let locked = unsafe { RootTruth::lock(self.truth, slot)};
+        locked.unwrap_option()
     }
 }
 
 thread_local! { static IS_COLLECTION: Cell<bool> = const { Cell::new(false) } }
 
 #[repr(transparent)]
-#[derive(Clone)]
 pub struct Gc<'root, T> {
     item: NonNull<Allocation<T>>,
     _lifetime: PhantomData<&'root RootTruth<T>>,
@@ -252,7 +269,22 @@ pub struct Gc<'root, T> {
     _aliased: PhantomPinned
 }
 
-impl<T> Gc<'_, T> {
+impl<T> Clone for Gc<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Gc<'_, T> {}
+
+
+impl<'root, T> Gc<'root, T> {
+    unsafe fn new_unbounded(item: T) -> Self where T: Trace {
+        let item = Allocation::new(item);
+        Context::push_alloc(item.as_ref());
+        Self { item, _lifetime: PhantomData, _aliased: PhantomPinned }
+    }
+
     /// marks just the immediate pointee
     pub unsafe fn set_mark(this: &Self, mark: bool) {
         let ptr = this.item;
@@ -293,11 +325,11 @@ unsafe impl<'to, T: WithGcLt<'to>> WithGcLt<'to> for Gc<'_, T> {
 
 macro_rules! root {
     ($root:ident) => {
-        let $root = std::pin::pin!( unsafe { crate::gc::RootTruth::new_empty() });
+        let $root = std::pin::pin!( unsafe { crate::gc::RootTruth::new() });
         let $root = unsafe { crate::gc::RootEmpty::new_unchecked($root) };
     };
     ($root:ident, $item:expr) => {
-        let $root = std::pin::pin!( unsafe { crate::gc::RootTruth::new_empty() });
+        let $root = std::pin::pin!( unsafe { crate::gc::RootTruth::new() });
         let $root = unsafe { crate::gc::Root::new_unchecked($root, $item) };
     };
 }

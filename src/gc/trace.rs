@@ -1,4 +1,4 @@
-use super::Gc;
+use super::{Allocation, Gc};
 
 pub unsafe trait Trace {
     unsafe fn mark(&self, mark: bool);
@@ -9,6 +9,15 @@ unsafe impl<T: Trace> Trace for Gc<'_, T> {
         if !Gc::is_marked(self, mark) {
             Gc::set_mark(self, mark);
             T::mark(&**self, mark)
+        }
+    }
+}
+
+unsafe impl<T: Trace> Trace for Allocation<T> {
+    unsafe fn mark(&self, mark: bool) {
+        if self.marked.get() != mark {
+            self.marked.set(mark);
+            self.item.mark(mark)
         }
     }
 }
