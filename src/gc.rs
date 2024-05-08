@@ -15,6 +15,14 @@ impl<T> Allocation<T> {
     fn new(item: T) -> NonNull<Self> {
        NonNull::new(Box::into_raw(Box::new(Self { marked: false.into(), item }))).unwrap()
     }
+
+    unsafe fn to_raw(this: NonNull<Self>) -> NonNull<T> {
+        unsafe { (&this.as_ref().item).into()}
+    }
+
+    unsafe fn from_raw(this: NonNull<T>) -> NonNull<Self> {
+        todo!()
+    }
 }
 
 pub struct Context {
@@ -61,7 +69,7 @@ impl Context {
     unsafe fn set_root<T: Trace>(slot: usize, root: NonNull<T>) {
         THREAD_CONTEXT.with(|tc| {
             let mut roots = tc.roots.borrow_mut();
-            debug_assert_eq!(roots[slot] as *const (), ptr::null());
+            // debug_assert_eq!(roots[slot] as *const (), ptr::null());
             type P = *const dyn Trace;
             let ptr = root.as_ptr() as P;
             let ptr = unsafe { std::mem::transmute::<P, P>(ptr) };
@@ -260,9 +268,10 @@ impl<'root, T: 'root> RootEmpty<'root, T> {
 
 thread_local! { static IS_COLLECTION: Cell<bool> = const { Cell::new(false) } }
 
+/// I want Gc to have the same repr as RootRef
 #[repr(transparent)]
 pub struct Gc<'root, T> {
-    item: NonNull<Allocation<T>>,
+    item: NonNull<T>,
     _lifetime: PhantomData<&'root RootTruth<T>>,
     /// need to be able to alias because we need to be able to trace even if there is a mutable
     /// reference to this. Note that that will only be possible through interior mutability.
@@ -294,6 +303,10 @@ impl<'root, T> Gc<'root, T> {
     pub fn is_marked(this: &Self, with_mark: bool) -> bool {
         let ptr = this.item;
         unsafe { (*ptr.as_ptr()).marked.get() == with_mark }
+    }
+
+    pub unsafe fn assume_rooted(self) -> RootRef<'root, T> {
+        mem::transmute(self)
     }
 }
 
@@ -333,6 +346,7 @@ macro_rules! root {
         let $root = unsafe { crate::gc::Root::new_unchecked($root, $item) };
     };
 }
+pub(crate) use root;
 
 macro_rules! reroot {
     ($root:ident, $gc:expr) => {
@@ -341,6 +355,7 @@ macro_rules! reroot {
         let $root = unsafe { crate::gc::Root::from_gc_unchecked($root, gc) };
     };
 }
+pub(crate) use reroot;
 
 // macro_rules! populate_root {
 //     ($root:ident, $item:ident, $($gc:ident: $from_root:ident),*$(,)?) => {

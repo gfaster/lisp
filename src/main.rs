@@ -2,7 +2,6 @@ use crate::env::{static_sym, Symbol};
 use std::any::Any;
 use std::cell::Cell;
 use std::io::prelude::{Read, Write};
-use std::rc::Rc;
 
 use env::Env;
 
@@ -11,24 +10,25 @@ mod intrinsics;
 mod error;
 use error::*;
 mod gc;
+use gc::{Gc, root, reroot};
 
-type LispResult = Result<Datum, Error>;
+type LispResult<'r> = Result<Datum<'r>, Error>;
 
 
 
 #[derive(Clone, Default)]
-enum Datum {
+enum Datum<'r> {
     Symbol(Symbol),
     Atom(i64),
-    Cons(Rc<Cons>),
-    Func(fn(List, Rc<Env>) -> LispResult),
-    Lambda(Rc<Lambda>),
-    Obj(Rc<dyn Any>),
-    Macro(Rc<Macro>),
+    Cons(Gc<'r, Cons<'r>>),
+    Func(fn(List, Gc<'r, Env>) -> LispResult<'r>),
+    Lambda(Gc<'r, Lambda<'r>>),
+    Obj(Gc<'r, Box<dyn Any>>),
+    Macro(Gc<'r, Macro<'r>>),
     Goto(Symbol),
 
     #[allow(dead_code)]
-    DynamicExtent(Rc<Env>),
+    DynamicExtent(Gc<'r, Env>),
 
     #[default]
     Nil,
@@ -51,7 +51,7 @@ enum Type {
     Nil
 }
 
-impl From<&Datum> for Type {
+impl From<&Datum<'_>> for Type {
     fn from(value: &Datum) -> Self {
         match value {
             Datum::Symbol(_) => Type::Symbol,
@@ -68,20 +68,20 @@ impl From<&Datum> for Type {
     }
 }
 
-impl std::fmt::Debug for Datum {
+impl std::fmt::Debug for Datum<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <Self as std::fmt::Display>::fmt(self, f)
     }
 }
 
-impl FromIterator<Datum> for Datum {
-    fn from_iter<T: IntoIterator<Item = Datum>>(iter: T) -> Self {
+impl<'r> FromIterator<Datum<'r>> for Datum<'r> {
+    fn from_iter<T: IntoIterator<Item = Datum<'r>>>(iter: T) -> Self {
         Datum::from_cdr(Cons::from_datums(iter))
     }
 }
 
-impl Datum {
-    fn from_cdr(cdr: Option<Rc<Cons>>) -> Self {
+impl<'r> Datum<'r> {
+    fn from_cdr(cdr: Option<Gc<'r, Cons>>) -> Self {
         match cdr {
             Some(cdr) => Datum::Cons(cdr),
             None => Datum::Nil,
@@ -98,7 +98,7 @@ impl Datum {
 
     fn as_list(&self) -> Result<List, TypeError> {
         match self {
-            Datum::Cons(c) => Ok(List(Some(Rc::clone(c)))),
+            Datum::Cons(c) => Ok(List(Some(Gc::clone(c)))),
             Datum::Nil => Ok(List(None)),
             _ => Err(type_err(Type::Cons, self)),
         }
@@ -133,7 +133,7 @@ impl Datum {
         self
     }
 
-    fn eval(&self, env: Rc<Env>) -> LispResult {
+    fn eval(&self, env: Gc<Env>) -> LispResult {
         match self {
             Datum::Symbol(s) => Ok(env.get(*s)?),
             Datum::Atom(i) => Ok(Datum::Atom(*i)),
@@ -148,7 +148,7 @@ impl Datum {
         }
     }
 
-    // fn resolve(self, env: Rc<Env>) -> LispResult {
+    // fn resolve(self, env: Gc<Env>) -> LispResult {
     //     match self {
     //         Datum::Symbol(s) => Ok(env.get(s)?),
     //         Datum::Cons(c) => c.resolve(env),
@@ -156,9 +156,9 @@ impl Datum {
     //     }
     // }
 
-    fn try_as<T: 'static>(&self) -> Result<Rc<T>, TypeError> {
+    fn try_as<T: 'static>(&self) -> Result<Gc<T>, TypeError> {
         if let Datum::Obj(o) = self {
-            if let Ok(ret) = Rc::clone(o).downcast() {
+            if let Ok(ret) = Gc::clone(o).downcast() {
                 return Ok(ret)
             }
         }
@@ -166,33 +166,33 @@ impl Datum {
     }
 }
 
-impl<const LEN: usize> From<[Datum; LEN]> for Datum {
+impl<'r, const LEN: usize> From<[Datum<'r>; LEN]> for Datum<'r> {
     fn from(value: [Datum; LEN]) -> Self {
         value.into_iter().collect()
     }
 }
 
-struct Lambda {
+struct Lambda<'r> {
     params: ArgList,
-    body: List,
+    body: List<'r>,
 }
 
-impl Lambda {
-    fn eval(&self, l: List, env: Rc<Env>) -> LispResult {
+impl<'r> Lambda<'r> {
+    fn eval(&self, l: List, env: Gc<Env>) -> LispResult {
         let l = l.into_iter().map(|x| x.eval(env.clone())).collect::<Result<List, _>>()?;
         let env = self.params.enter_env(l, env)?;
         intrinsics::progn(self.body.clone(), env)
     }
 }
 
-struct Macro {
+struct Macro<'r> {
     /// these symbols should be unique
     args: ArgList,
-    body: Datum,
+    body: Datum<'r>,
 }
 
-impl Macro {
-    fn expand(&self, l: List, env: Rc<Env>) -> LispResult {
+impl<'r> Macro<'r> {
+    fn expand(&self, l: List, env: Gc<Env>) -> LispResult {
         // dbg!(&l);
         let env = self.args.enter_env(l, env)?;
         // Ok(Datum::from_iter([Datum::DynamicExtent(env), self.body.clone()]))
@@ -200,12 +200,12 @@ impl Macro {
     }
 }
 
-struct Cons {
-    car: Cell<Datum>,
-    cdr: Cell<Option<Rc<Cons>>>,
+struct Cons<'r> {
+    car: Cell<Datum<'r>>,
+    cdr: Cell<Datum<'r>>,
 }
 
-impl Cons {
+impl<'r> Cons<'r> {
     fn new_pair(car: Datum, cdr: List) -> Self {
         Cons {
             car: car.into(),
@@ -229,11 +229,11 @@ impl Cons {
         }
     }
 
-    fn from_datums(iter: impl IntoIterator<Item = Datum>) -> Option<Rc<Self>> {
+    fn from_datums(iter: impl IntoIterator<Item = Datum<'r>>) -> Option<Gc<'r, Self>> {
         let mut ret = None;
         let mut tail = None;
         for datum in iter {
-            let new = Rc::new(Cons::new(datum));
+            let new = Gc::new(Cons::new(datum));
             if matches!(ret, None) {
                 ret = Some(new);
                 tail = ret.clone();
@@ -260,7 +260,7 @@ impl Cons {
         car
     }
 
-    fn get_cdr(&self) -> Option<Rc<Cons>> {
+    fn get_cdr(&self) -> Option<Datum> {
         let cdr = self.cdr.take();
         self.cdr.set(cdr.clone());
         cdr
@@ -276,16 +276,16 @@ impl Cons {
         self.get_cdr().and_then(|x| x.get_cdr()).map(|x| x.get_car())
     }
 
-    #[allow(dead_code)]
-    fn iter(self: Rc<Self>) -> DatumIter {
-        DatumIter { cons: Some(self) }
-    }
+    // #[allow(dead_code)]
+    // fn iter(self: Gc<Self>) -> DatumIter {
+    //     DatumIter { cons: Some(self) }
+    // }
 
-    // fn resolve(self: Rc<Self>, env: Rc<Env>) {
+    // fn resolve(self: Gc<Self>, env: Gc<Env>) {
     // }
 
 
-    fn eval(&self, env: Rc<Env>) -> LispResult {
+    fn eval(&self, env: Gc<Env>) -> LispResult {
         // eprintln!("car before eval {}", self.get_car());
         // let op = match self.get_car() {
         //     fail @ Datum::Atom(_) | fail @ Datum::Obj(_) | fail @ Datum::Nil => return Err(WrongTypeToApply(fail).into()),
@@ -311,18 +311,18 @@ impl Cons {
     }
 }
 
-struct DatumIter {
-    cons: Option<Rc<Cons>>,
+struct DatumIter<'r> {
+    cons: Option<Gc<'r, Cons<'r>>>,
 }
 
-impl DatumIter {
-    fn rem(self) -> List {
+impl<'r> DatumIter<'r> {
+    fn rem(self) -> List<'r> {
         List(self.cons)
     }
 }
 
-impl Iterator for DatumIter {
-    type Item = Datum;
+impl<'r> Iterator for DatumIter<'r> {
+    type Item = Datum<'r>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let curr = self.cons.take()?;
@@ -331,7 +331,7 @@ impl Iterator for DatumIter {
     }
 }
 
-impl std::fmt::Display for Datum {
+impl std::fmt::Display for Datum<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Datum::Symbol(s) => write!(f, "{s}"),
@@ -348,7 +348,7 @@ impl std::fmt::Display for Datum {
     }
 }
 
-impl std::fmt::Display for Cons {
+impl std::fmt::Display for Cons<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "({}", self.get_car())?;
         let mut cdr = self.get_cdr();
@@ -361,7 +361,7 @@ impl std::fmt::Display for Cons {
 }
 
 #[derive(Clone)]
-struct List(Option<Rc<Cons>>);
+struct List<'r>(Option<Gc<'r, Cons<'r>>>);
 
 // const NIL: List = List(None);
 
@@ -475,7 +475,7 @@ impl ArgList {
         })
     }
 
-    fn enter_env(&self, args: List, env: Rc<Env>) -> Result<Rc<Env>, Error> {
+    fn enter_env(&self, args: List, env: Gc<Env>) -> Result<Gc<Env>, Error> {
         let env = env.extend();
         if self.last_is_rest {
             let mut it = args.into_iter();
@@ -537,7 +537,7 @@ fn read(buf: &str) -> Datum {
         }
         while let Some((i, c)) = it.next() {
             if c == '"' {
-                let ret: Rc<dyn Any> = Rc::new(buf);
+                let ret: Gc<dyn Any> = Gc::new(buf);
                 return (Datum::Obj(ret), &s[(i + 1)..]);
             }
             if c == '\\' {
@@ -616,7 +616,7 @@ fn read(buf: &str) -> Datum {
     read_s(buf).0
 }
 
-fn read_file(p: impl AsRef<std::path::Path>, env: Rc<Env>) -> std::io::Result<()> {
+fn read_file(p: impl AsRef<std::path::Path>, env: Gc<Env>) -> std::io::Result<()> {
     let mut f = std::fs::File::open(p)?;
     let mut buf = String::from("(list ");
     f.read_to_string(&mut buf)?;
@@ -634,7 +634,7 @@ fn main() {
         print!("> ");
         std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut buf).unwrap();
-        match read(&buf).eval(Rc::clone(&root_env)) {
+        match read(&buf).eval(Gc::clone(&root_env)) {
             Ok(dat) => {
                 println!("{dat}");
             }

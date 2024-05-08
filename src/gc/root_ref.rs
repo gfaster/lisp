@@ -1,6 +1,6 @@
-use std::{marker::PhantomData, pin::Pin, ptr::NonNull};
+use std::{marker::PhantomData, ops::Deref, pin::Pin, ptr::NonNull};
 
-use super::{Root, RootTruth};
+use super::{Gc, Root, RootTruth};
 
 fn mk<'root, T>(item: &'root T) -> RootRef<'root, T> {
     RootRef { _phantom: PhantomData, item: item.into()}
@@ -68,3 +68,21 @@ macro_rules! impl_trivial_deref {
 }
 
 impl_trivial_deref!(RootRef: u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64, (), String, str);
+
+// #[derive(Clone, Copy, Default)]
+// pub enum DatumRt<'r> {
+//     Symbol(crate::Symbol),
+//     Atom(i64),
+//     Cons(Gc<'r, crate::Cons>),
+//     Func(fn(crate::List, Gc<'r, crate::Env>) -> crate::LispResult<'r>),
+//     Lambda(crate::Gc<'r, crate::Lambda>),
+//     Obj(crate::Gc<'r, Box<dyn crate::Any>>),
+//     Macro(crate::Gc<'r, crate::Macro>),
+//     Goto(crate::Symbol),
+//
+//     #[allow(dead_code)]
+//     DynamicExtent(crate::Gc<'r, crate::Env>),
+//
+//     #[default]
+//     Nil,
+// }
